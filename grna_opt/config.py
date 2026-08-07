@@ -30,6 +30,10 @@ class ScorerConfig:
 
 @dataclass
 class TargetConfig:
+    # config -> use `sequence` below
+    # paired -> use the sgRNA target site paired with the seed guide, which only
+    #           the off-target example formats provide
+    source: str = "config"
     name: str = "user_target"
     sequence: str = ""
 
@@ -44,10 +48,21 @@ class DatasetSeedConfig:
 
 
 @dataclass
+class ExamplesSeedConfig:
+    path: str = "DeepCRISPR/examples/eg_reg_off_target.repiotrt"
+    index: int = 0                     # 0 = weakest candidate
+    # predicted -> rank by the frozen on-target model (required for off-target
+    #              files, whose labels are all 0.0 and mean something else)
+    # label     -> rank by the file's own label
+    rank_by: str = "predicted"
+
+
+@dataclass
 class SeedGuideConfig:
-    mode: str = "dataset"              # dataset | target_scan | explicit
+    mode: str = "dataset"              # dataset | examples | target_scan | explicit
     sequence: str | None = None        # used when mode == "explicit"
     dataset: DatasetSeedConfig = field(default_factory=DatasetSeedConfig)
+    examples: ExamplesSeedConfig = field(default_factory=ExamplesSeedConfig)
 
 
 @dataclass

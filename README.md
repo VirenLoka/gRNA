@@ -36,6 +36,39 @@ Override the target region or the seed without touching the config:
 python run.py --target-file my_region.fa --steps 4000 --device cuda
 ```
 
+## Where the negatives and targets come from
+
+Default: `DeepCRISPR/examples/eg_reg_off_target.repiotrt`.
+
+There is a naming trap in the DeepCRISPR data. In the **on-target** files the
+column the README calls "Target Seq" *is* the 23nt guide+PAM — there is no
+separate target DNA region in them. Only the **off-target** files carry two
+distinct sequences per row:
+
+| Column | Meaning | Role here |
+|---|---|---|
+| `Target Seq` | the sgRNA's intended on-target site | **target DNA** |
+| `Off-target Seq` | a mismatched genomic site that fails to cut | **negative seed guide** |
+
+So a row gives a genuine (guide, target) pair ~5–6 mismatches apart, which keeps
+cross-attention non-degenerate. The default run picks:
+
+```
+seed   GAATTGTCTGGATTGTTTTCAGG   sg14 off-target site, predicted efficacy 0.0816
+target GACTTGTTTTCATTGTTCTCAGG   sg14 intended site, 5 mismatches away
+```
+
+**Labels from these files are ignored.** Every label in the off-target
+regression file is `0.0`, and it scores cleavage at the *off-target locus* — not
+on-target efficacy, which is what our frozen scorer predicts. Ranking therefore
+comes from the scorer itself (`rank_by: predicted`), which sorts all 100 rows by
+predicted on-target efficacy (range 0.0816–0.4321) and takes the weakest.
+
+All five example formats load via `grna_opt/data.py`; switch with
+`seed_guide.examples.path`. `target.source: config` reverts to pasting your own
+region into `config.yaml`, and `seed_guide.mode: dataset` uses the full paper
+datasets instead (8101 HeLa guides, worst measured efficacy exactly 0.000000).
+
 ## Why the on-target **regression** model
 
 Set by inspecting the checkpoints rather than the paper:
@@ -131,26 +164,49 @@ the reward over several Gumbel samples per step steadies it.
 ## ⚠️ Reward hacking is real here
 
 With PAM lock as the only active constraint the optimiser is free to drift
-arbitrarily far from the seed, and it does. A 60-step demo run produced:
+arbitrarily far from the seed, and it does. An 80-step run on the default
+sg14 pair produced:
 
 ```
-seed       TGGTTCTATACTCAGGAGCCAGG   efficacy = -0.001
-best       TCGTTCAATACTCAGGAGGAAGG   efficacy =  0.470   (4 substitutions)
-final      AAGAAAAAAACACGGAAGGAAGG   efficacy =  0.367   (15 substitutions)
+seed       GAATTGTCTGGATTGTTTTCAGG   efficacy = 0.082
+optimised  GCGGGGGCGGGGGGGGGGTGTGG   efficacy = 0.469   (14 substitutions)
 ```
 
-The `best` result is a plausible 4-substitution edit. The `final` greedy decode
-has collapsed into a degenerate A-rich sequence — high-scoring under the frozen
-CNN, biologically meaningless, and no longer complementary to the target. This
-is the expected failure mode of optimising against a fixed learned reward.
+That is 18 G's out of 23, with per-position entropy collapsed to 0.046. It
+scores well under the frozen CNN and is worthless in practice: poly-G forms
+G-quadruplexes, is hard to synthesise, and at 14 mismatches no longer binds the
+target at all. This is the expected failure mode of optimising against a fixed
+learned reward, not a bug.
+
+Switching the soft constraints on changes the outcome to a plausible edit:
+
+```yaml
+constraints: {edit_distance_weight: 0.02, seed_region_weight: 0.05,
+              gc_weight: 0.5, homopolymer_weight: 0.5}
+```
+
+```
+optimised  GAATTGGCTGGATGGTGTTCGGG   efficacy = 0.303   (4 substitutions)
+                                     T7G, T14G, T17G, A21G
+```
+
+Treat those weights as a starting point, not a tuned setting. In that same run
+entropy collapsed to 0.001 within ~25 steps and the reward sat pinned at the
+seed's own score — the edit-distance term was dominating, and the 0.303 result
+came from an early Gumbel sample rather than from learned improvement. Expect to
+trade `edit_distance_weight` down against `training.entropy_weight` up. Both runs
+above are 80-step CPU smoke tests and say nothing reliable about 2000-step
+behaviour on a GPU.
 
 Two further caveats worth stating plainly:
 
 * The sequence-only model **has no genomic context** (`SPACER_OPTIMIZATION.md`).
   It scores intrinsic sequence-determined cutting propensity, not in-cell
-  efficacy. It also never sees `target.sequence` — the target shapes what the
-  generator *conditions on*, not the reward.
+  efficacy. It also never sees the target — the target shapes what the generator
+  *conditions on*, not the reward.
 * Nothing forces the optimised guide to still bind your target.
+* With the paired setup the target is only **23nt**, so cross-attention has a
+  short context to work with. `target.source: config` accepts a full region.
 
 `constraints.py` implements the countermeasures; all are weighted `0.0` in the
 shipped config per the chosen setup. Raise a weight to switch one on:

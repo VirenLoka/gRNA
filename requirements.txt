@@ -1,0 +1,17 @@
+# Core dependencies for the guide RNA optimisation engine.
+#
+# No TensorFlow: DeepCRISPR's TF1/Sonnet checkpoints are parsed directly by
+# grna_opt/tf_checkpoint.py (pure-Python SSTable + protobuf reader) and ported
+# to PyTorch by grna_opt/deepcrispr_torch.py. See README.md.
+#
+# torch is left unpinned to a specific build: on the GPU training box, install
+# the CUDA build matching that machine's driver from
+# https://pytorch.org/get-started/locally/ *before* `pip install -r
+# requirements.txt`, so pip resolves against the already-installed GPU wheel
+# instead of pulling the CPU-only default.
+torch>=2.2
+
+numpy>=1.24
+pandas>=2.0
+PyYAML>=6.0
+tqdm>=4.65

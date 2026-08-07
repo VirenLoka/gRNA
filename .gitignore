@@ -1,0 +1,42 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.Python
+build/
+dist/
+*.egg
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Converted DeepCRISPR checkpoints ---
+# Reproducible from DeepCRISPR/trained_models/*.tar.gz via
+# `python -m grna_opt.convert_checkpoint`; the source tarballs are already
+# versioned inside the DeepCRISPR submodule, so the derived .pt doesn't need to
+# be in history too.
+checkpoints/*.pt
+
+# --- Training runs ---
+# Each run.py invocation writes its own runs/<name>/ (logs, metrics, generator
+# checkpoints) — reproducible, and grows without bound if committed.
+runs/*/
+!runs/.gitkeep
+
+# --- Extracted DeepCRISPR data ---
+# convert_checkpoint.py / data.py untar these into place on first use; keep the
+# archives in the DeepCRISPR submodule, not the expanded copies here.
+DeepCRISPR/trained_models/*/
+DeepCRISPR/paper_data/
+DeepCRISPR/paper_data2/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Jupyter, if notebooks get added later ---
+.ipynb_checkpoints/

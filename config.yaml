@@ -29,16 +29,20 @@ scorer:
   checkpoint: checkpoints/ontar_cnn_reg_seq.pt
 
 target:
-  name: demo_region
-  # >>> REPLACE THIS WITH YOUR TARGET DNA REGION <<<
+  # paired -> the sgRNA's intended target site, taken from the seed guide's own
+  #           row in an off-target example file.  Only .epiotrt/.repiotrt pair a
+  #           guide with a distinct sequence; in the on-target files the column
+  #           called "Target Seq" IS the 23nt guide+PAM.
+  # config -> use `sequence` below instead
+  source: paired
+  name: paired_site
+
+  # Used only when source: config. Accepts multi-line and FASTA-style input.
+  # Placeholder below is composition-matched synthetic flanks (~41% GC) with a
+  # low-efficacy HeLa guide embedded at offset 108 — not real genomic sequence.
   #
-  # Placeholder only: composition-matched synthetic flanks (~41% GC) with the
-  # default seed guide embedded at offset 108.  It exists so `python run.py`
-  # works out of the box; it is not real genomic sequence.
-  #
-  # Note the scope of what this controls: the sequence-only scorer never sees
-  # the target, so the target shapes what the generator *conditions* on, not the
-  # reward.  Accepts multi-line and FASTA-style input.
+  # Note the scope: the sequence-only scorer never sees the target, so this
+  # shapes what the generator *conditions on*, not the reward.
   sequence: |
     AAAGGCTGAGCACGCCGGTGGTCCATCTCTACATCCTTTATCTCCTTCTCTCAATTAAAA
     GATCCCCATATTAACTTGTCCTACTTTACTACTAGGTCGAGAATAATGTGGTTCTATACT
@@ -46,11 +50,25 @@ target:
     ATGTCATATTCAGAAAAGCAGTGGCTAGTTGTCCTACCATTATTAACATGATTATCCGAA
 
 seed_guide:
-  # dataset     -> worst measured guide from a DeepCRISPR paper dataset (default)
+  # examples    -> a negative from DeepCRISPR/examples/ (default)
+  # dataset     -> worst measured guide from a full paper dataset
   # target_scan -> score every NGG site in target.sequence, start from the worst
   # explicit    -> use seed_guide.sequence verbatim
-  mode: dataset
+  mode: examples
   sequence: null          # for mode: explicit, e.g. TGGTTCTATACTCAGGAGCCAGG
+
+  examples:
+    # Off-target file: each row pairs an off-target site (the negative — it does
+    # not cut) with the sgRNA's intended target site, ~5-6 mismatches away.
+    path: DeepCRISPR/examples/eg_reg_off_target.repiotrt
+    index: 0              # 0 = weakest candidate under the chosen ranking
+
+    # predicted -> rank all rows by the frozen on-target model, ascending.
+    #              Required for off-target files: every label in them is 0.0 and
+    #              scores cleavage at the off-target locus, not on-target
+    #              efficacy, so labels cannot order candidates for this task.
+    # label     -> rank by the file's own label (on-target files only)
+    rank_by: predicted
 
   dataset:
     # Auto-extracted from DeepCRISPR/paper_data-regression.tar.gz on first use.
@@ -58,7 +76,7 @@ seed_guide:
     sequence_column: 4
     label_column: 9
     percentile: 5.0       # bottom 5% by measured efficacy -> 406 guides
-    index: 0              # 0 = the very worst; default is TGGTTCTATACTCAGGAGCCAGG
+    index: 0              # 0 = the very worst: TGGTTCTATACTCAGGAGCCAGG
                           # at measured efficacy 0.000000 (chr6:31760553-31760575)
 
 generator:

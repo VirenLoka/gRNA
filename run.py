@@ -24,7 +24,7 @@ import torch
 
 from grna_opt.config import load_config, resolve_device
 from grna_opt.data import clean_dna, resolve_seed_guide
-from grna_opt.encoding import GUIDE_LENGTH
+from grna_opt.encoding import GUIDE_LENGTH, hamming_distance
 from grna_opt.logging_utils import (create_run_dir, save_config_snapshot,
                                     save_summary, setup_logging)
 from grna_opt.scorer import DeepCRISPRScorer
@@ -97,13 +97,36 @@ def main() -> int:
     logger.info("scorer: %s (%d-channel, %s head) — frozen",
                 scorer.source_model, scorer.in_channels, scorer.head)
 
-    # --- target DNA ---------------------------------------------------------
-    target = clean_dna(config.target.sequence, "target.sequence")
-    if PLACEHOLDER_MARKER in target:
-        logger.warning(
-            "using the placeholder demo target from config.yaml — replace "
-            "target.sequence (or pass --target-file) with your real region"
+    # --- target DNA and seed guide ------------------------------------------
+    # With target.source == "paired" the target comes from the seed's own row in
+    # an off-target example file, so the seed has to be resolved first.
+    paired = config.target.source == "paired"
+
+    if paired:
+        seed_guide = resolve_seed_guide(config, scorer=scorer, target="")
+        if not seed_guide.paired_target:
+            logger.error(
+                "target.source='paired' needs a seed from an off-target example "
+                "file (.epiotrt/.repiotrt), which is the only format pairing a "
+                "guide with a distinct target site; %s provides none",
+                seed_guide.source,
+            )
+            return 1
+        target = clean_dna(seed_guide.paired_target, "paired target site")
+        config.target.name = f"paired:{seed_guide.guide_id or 'site'}"
+        logger.info(
+            "target is the sgRNA's intended site, %d mismatch(es) from the seed",
+            hamming_distance(seed_guide.sequence, target),
         )
+    else:
+        target = clean_dna(config.target.sequence, "target.sequence")
+        if PLACEHOLDER_MARKER in target:
+            logger.warning(
+                "using the placeholder demo target from config.yaml — replace "
+                "target.sequence (or pass --target-file) with your real region"
+            )
+        seed_guide = resolve_seed_guide(config, scorer=scorer, target=target)
+
     logger.info("target '%s': %dnt", config.target.name, len(target))
     if len(target) > config.generator.target_max_length:
         logger.error(
@@ -112,9 +135,6 @@ def main() -> int:
             len(target), config.generator.target_max_length,
         )
         return 1
-
-    # --- seed guide ---------------------------------------------------------
-    seed_guide = resolve_seed_guide(config, scorer=scorer)
     logger.info("seed guide: %s", seed_guide.describe())
 
     # --- optimise -----------------------------------------------------------
@@ -142,11 +162,19 @@ def main() -> int:
         "run_dir": str(run_dir),
         "device": str(device),
         "scorer": scorer.source_model,
+        "target_source": config.target.source,
         "target_name": config.target.name,
+        "target_sequence": target if len(target) <= 128 else None,
         "target_length": len(target),
         "seed_source": seed_guide.source,
-        "seed_measured_efficacy": seed_guide.measured_efficacy,
+        "seed_guide_id": seed_guide.guide_id,
+        "seed_measured_ontarget_efficacy": seed_guide.measured_efficacy,
+        "seed_file_label": seed_guide.file_label,
+        "seed_file_label_meaning": seed_guide.file_label_meaning,
         "seed_locus": seed_guide.locus,
+        "seed_target_mismatches": (
+            hamming_distance(seed_guide.sequence, target) if len(target) == GUIDE_LENGTH else None
+        ),
         "seed_sequence": result.seed_sequence,
         "seed_predicted_efficacy": result.seed_score,
         "best_sequence": result.best_sequence,
