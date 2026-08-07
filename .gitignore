@@ -29,9 +29,6 @@ runs/*/
 # --- Extracted DeepCRISPR data ---
 # convert_checkpoint.py / data.py untar these into place on first use; keep the
 # archives in the DeepCRISPR submodule, not the expanded copies here.
-DeepCRISPR/trained_models/*/
-DeepCRISPR/paper_data/
-DeepCRISPR/paper_data2/
 
 # --- Editors / OS ---
 .vscode/
