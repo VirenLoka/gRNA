@@ -1,0 +1,110 @@
+# ---------------------------------------------------------------------------
+# Guide RNA optimisation engine
+#
+# A cross-attention transformer proposes selective mutations to a low-efficacy
+# guide, a straight-through Gumbel-softmax turns its output into a hard one-hot,
+# and a frozen DeepCRISPR on-target CNN scores it.  Gradients flow back through
+# the frozen scorer into the generator; only the generator trains.
+#
+# Before the first run:
+#   python -m grna_opt.convert_checkpoint --model ontar_cnn_reg_seq
+# ---------------------------------------------------------------------------
+
+run:
+  name: null              # null -> runs/run_<timestamp>
+  output_dir: runs
+  seed: 42
+  device: auto            # auto | cpu | cuda | mps
+  log_level: INFO
+
+scorer:
+  # Sequence-only regression head, 4-channel.  This is the only on-target
+  # checkpoint that needs no epigenetic tracks, and its raw output is already an
+  # efficacy estimate in [0, 1] (verified: Spearman +0.89 / MAE 0.038 vs held-out
+  # HeLa labels).  Do not apply a sigmoid to it.
+  #
+  # The 8-channel alternatives (ontar_pt_cnn_reg, ontar_ptaug_cnn) require CTCF,
+  # DNase, H3K4me3 and RRBS channels tied to a genomic locus, which a mutated
+  # spacer no longer has.  See SPACER_OPTIMIZATION.md.
+  checkpoint: checkpoints/ontar_cnn_reg_seq.pt
+
+target:
+  name: demo_region
+  # >>> REPLACE THIS WITH YOUR TARGET DNA REGION <<<
+  #
+  # Placeholder only: composition-matched synthetic flanks (~41% GC) with the
+  # default seed guide embedded at offset 108.  It exists so `python run.py`
+  # works out of the box; it is not real genomic sequence.
+  #
+  # Note the scope of what this controls: the sequence-only scorer never sees
+  # the target, so the target shapes what the generator *conditions* on, not the
+  # reward.  Accepts multi-line and FASTA-style input.
+  sequence: |
+    AAAGGCTGAGCACGCCGGTGGTCCATCTCTACATCCTTTATCTCCTTCTCTCAATTAAAA
+    GATCCCCATATTAACTTGTCCTACTTTACTACTAGGTCGAGAATAATGTGGTTCTATACT
+    CAGGAGCCAGGTCTAAAACTGAATTTGGAGTTTAGTTACCAGTGCTTCAAGAGTCGCGAG
+    ATGTCATATTCAGAAAAGCAGTGGCTAGTTGTCCTACCATTATTAACATGATTATCCGAA
+
+seed_guide:
+  # dataset     -> worst measured guide from a DeepCRISPR paper dataset (default)
+  # target_scan -> score every NGG site in target.sequence, start from the worst
+  # explicit    -> use seed_guide.sequence verbatim
+  mode: dataset
+  sequence: null          # for mode: explicit, e.g. TGGTTCTATACTCAGGAGCCAGG
+
+  dataset:
+    # Auto-extracted from DeepCRISPR/paper_data-regression.tar.gz on first use.
+    path: DeepCRISPR/paper_data2/ontar/hela.repisgt
+    sequence_column: 4
+    label_column: 9
+    percentile: 5.0       # bottom 5% by measured efficacy -> 406 guides
+    index: 0              # 0 = the very worst; default is TGGTTCTATACTCAGGAGCCAGG
+                          # at measured efficacy 0.000000 (chr6:31760553-31760575)
+
+generator:
+  d_model: 128
+  n_heads: 4
+  n_layers: 4             # target encoder uses n_layers // 2
+  d_ff: 512
+  dropout: 0.1
+  soft_prompt_length: 8   # learnable prefix; 0 disables
+  target_max_length: 512  # raise for longer target regions
+  # Biases the untrained output toward the seed's own bases, so step 0 emits
+  # approximately the seed and training searches for *selective mutations*.
+  # Set to 0.0 for a fully unbiased random start.
+  identity_bias: 3.0
+
+gumbel:
+  hard: true              # straight-through: hard forward, soft backward
+  tau_start: 2.0          # smooth early, so the gradient behaves while random
+  tau_end: 0.5            # sharp late, so the sample matches what the scorer saw
+  anneal: exponential     # linear | exponential | none
+  n_samples: 4            # samples per step; averaging cuts estimator variance
+
+constraints:
+  # PAM lock is enforced structurally (logits masked to -inf), not as a penalty,
+  # so every sample is a valid SpCas9 site and no reward is spent on it.
+  lock_pam: true
+  pam_lock_positions: [21, 22]   # 0-indexed: the GG of NGG. Position 20 (N) stays free.
+
+  # Soft guards, all off per the chosen setup. Optimising against a frozen CNN
+  # with no restraint will find adversarial sequences that score high and mean
+  # nothing biologically — raise a weight to restrain it.
+  edit_distance_weight: 0.0      # try 0.02: keep the guide near the seed
+  seed_region_weight: 0.0        # try 0.05: protect the PAM-proximal seed region
+  seed_region_start: 10
+  gc_weight: 0.0                 # try 0.5: keep spacer GC in [gc_low, gc_high]
+  gc_low: 0.40
+  gc_high: 0.70
+  homopolymer_weight: 0.0        # try 0.5: TTTT terminates Pol III transcription
+  homopolymer_max_run: 4
+
+training:
+  steps: 2000
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  entropy_weight: 0.01    # discourages premature collapse to one base per position
+  log_every: 25
+  eval_every: 100
+  checkpoint_every: 500
