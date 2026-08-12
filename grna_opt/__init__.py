@@ -26,4 +26,5 @@ __all__ = [
     "scorer",
     "tf_checkpoint",
     "trainer",
+    "validity",
 ]

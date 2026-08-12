@@ -18,10 +18,11 @@ Three ways to obtain the seed are supported, matching ``seed_guide.mode``:
     the frozen scorer, and start from the worst.  Use this when the guide must
     genuinely bind *your* target.
 ``examples``
-    Take a negative straight from ``DeepCRISPR/examples/``.  Regression files
-    sort ascending by measured efficacy; classification files keep label-0 rows.
-    The off-target formats additionally carry a *paired* sgRNA target site, which
-    ``target.source: paired`` can adopt as the target DNA.
+    Take a negative straight from ``DeepCRISPR/examples/``.  For the paired
+    off-target formats this first picks a target site — by default a different
+    one at random each run, see ``seed_guide.examples.target_selection`` — then
+    ranks the rows sharing it (by predicted efficacy by default) and takes the
+    weakest.  ``target.source: paired`` adopts that target as the target DNA.
 ``explicit``
     Use a 23-mer you name outright.
 
@@ -32,6 +33,7 @@ region.  Only the off-target files pair a guide with a distinct DNA sequence.
 
 from __future__ import annotations
 
+import random
 import re
 import tarfile
 from dataclasses import dataclass
@@ -305,30 +307,80 @@ _LABEL_MEANING = {
 }
 
 
-def select_negative_from_examples(path: str | Path, index: int = 0,
-                                  scorer=None, rank_by: str = "predicted") -> SeedGuide:
+def _select_target_group(frame: pd.DataFrame, fmt: ExampleFormat, target_selection: str,
+                         target_id: str | None) -> tuple[pd.DataFrame, str | None]:
+    """Narrow ``frame`` to one target's rows, for the paired off-target formats.
+
+    Grouping is by sgRNA id rather than by row: in the shipped
+    ``eg_reg_off_target.repiotrt`` the 100 rows cover only 13 unique target
+    sites, and one of them alone accounts for 67 rows, so a uniform draw over
+    rows would almost always land on that one target.  id<->target sequence is
+    a verified 1:1 mapping in both off-target example files.
+
+    Returns ``(group, chosen_id)`` — ``chosen_id`` is None when there was
+    nothing to choose (on-target formats, or ``target_selection="fixed"``).
+    """
+    if not fmt.is_paired:
+        return frame, None  # on-target files have no distinct target to group by
+
+    if target_id is not None:
+        group = frame[frame["id"] == target_id]
+        if group.empty:
+            available = sorted(frame["id"].dropna().unique())
+            raise ValueError(f"target_id={target_id!r} not found in this file; "
+                             f"available ids: {available}")
+        return group.reset_index(drop=True), target_id
+
+    if target_selection == "fixed":
+        return frame, None
+
+    if target_selection != "random":
+        raise ValueError(f"unknown target_selection={target_selection!r}; expected random|fixed")
+
+    unique_ids = sorted(frame["id"].dropna().unique())  # sorted: a stable draw for a given seed
+    chosen_id = random.choice(unique_ids)
+    group = frame[frame["id"] == chosen_id].reset_index(drop=True)
+    get_logger().info("%d unique target site(s) available; randomly selected %s (%d row(s))",
+                      len(unique_ids), chosen_id, len(group))
+    return group, chosen_id
+
+
+def select_negative_from_examples(path: str | Path, index: int = 0, scorer=None,
+                                  rank_by: str = "predicted", target_selection: str = "random",
+                                  target_id: str | None = None) -> SeedGuide:
     """Take the ``index``-th weakest guide from an ``examples/`` file.
 
     Args:
-        rank_by: ``"predicted"`` ranks every row by the frozen on-target model's
-            predicted efficacy, ascending.  This is the default because the
-            off-target files' own labels are all 0.0 — they score cleavage at the
-            off-target locus, not on-target efficacy, so they cannot order
-            candidates for this task at all.  ``"label"`` uses the file's label
-            instead, which is only meaningful for the on-target formats.
+        rank_by: ``"predicted"`` ranks candidates by the frozen on-target
+            model's predicted efficacy, ascending.  This is the default because
+            the off-target files' own labels are all 0.0 — they score cleavage
+            at the off-target locus, not on-target efficacy, so they cannot
+            order candidates for this task at all.  ``"label"`` uses the file's
+            label instead, which is only meaningful for the on-target formats.
+        target_selection: for the paired off-target formats, ``"random"``
+            (default) first draws one target site uniformly from the file's
+            *unique* target sites via the ``random`` module — reproducible from
+            ``run.seed`` — then ranks only the rows sharing that target.
+            ``"fixed"`` ranks every row in the file together, ignoring which
+            target it belongs to.  Ignored for the on-target formats.
+        target_id: pin a specific target's sgRNA id (e.g. ``"sg14"``),
+            overriding ``target_selection`` entirely.
     """
     frame = load_examples(path)
     fmt: ExampleFormat = frame.attrs["format"]
     logger = get_logger()
 
+    pool_all, chosen_target_id = _select_target_group(frame, fmt, target_selection, target_id)
+    target_note = f" for target {chosen_target_id}" if chosen_target_id else ""
+
     if rank_by == "predicted":
         if scorer is None:
             raise ValueError("rank_by='predicted' needs a scorer")
-        scores = scorer.score_sequences(frame["guide"].tolist()).cpu().numpy()
-        pool = frame.assign(predicted=scores).sort_values("predicted").reset_index(drop=True)
+        scores = scorer.score_sequences(pool_all["guide"].tolist()).cpu().numpy()
+        pool = pool_all.assign(predicted=scores).sort_values("predicted").reset_index(drop=True)
         logger.info(
-            "%s [%s]: %d row(s); predicted on-target efficacy %.4f-%.4f, ranked ascending",
-            Path(path).name, fmt.name, len(pool),
+            "%s [%s]%s: %d row(s); predicted on-target efficacy %.4f-%.4f, ranked ascending",
+            Path(path).name, fmt.name, target_note, len(pool),
             float(pool["predicted"].min()), float(pool["predicted"].max()),
         )
         if fmt.name.startswith("off_target"):
@@ -338,36 +390,41 @@ def select_negative_from_examples(path: str | Path, index: int = 0,
             )
     elif rank_by == "label":
         if fmt.task == "classification":
-            pool = frame[frame["label"] == 0].reset_index(drop=True)
+            pool = pool_all[pool_all["label"] == 0].reset_index(drop=True)
             if pool.empty:
-                raise ValueError(f"{path} contains no label-0 (negative) rows")
+                raise ValueError(f"no label-0 (negative) rows{target_note} in {path}")
         else:
-            pool = frame.sort_values("label").reset_index(drop=True)
+            pool = pool_all.sort_values("label").reset_index(drop=True)
             if pool["label"].nunique() == 1:
                 logger.warning(
-                    "every label in %s is %g, so rank_by='label' cannot order "
+                    "every label%s in %s is %g, so rank_by='label' cannot order "
                     "candidates — falling back to file order (use rank_by='predicted')",
-                    Path(path).name, float(pool["label"].iloc[0]),
+                    target_note, Path(path).name, float(pool["label"].iloc[0]),
                 )
         pool = pool.assign(predicted=np.nan)
-        logger.info("%s [%s]: %d candidate(s) ranked by file label",
-                    Path(path).name, fmt.name, len(pool))
+        logger.info("%s [%s]%s: %d candidate(s) ranked by file label",
+                    Path(path).name, fmt.name, target_note, len(pool))
     else:
         raise ValueError(f"unknown rank_by={rank_by!r}; expected predicted|label")
 
     if index >= len(pool):
         raise IndexError(
             f"seed_guide.examples.index={index} but only {len(pool)} candidate(s) "
-            f"available in {path}"
+            f"available{target_note} in {path}"
         )
 
     row = pool.iloc[index]
     is_ontarget = fmt.name.startswith("on_target")
     predicted = row["predicted"]
 
+    source = f"{Path(path).name}[{fmt.name}, "
+    if chosen_target_id:
+        source += f"target={chosen_target_id}, "
+    source += f"{rank_by} rank {index}]"
+
     guide = SeedGuide(
         sequence=row["guide"],
-        source=f"{Path(path).name}[{fmt.name}, {rank_by} rank {index}]",
+        source=source,
         measured_efficacy=float(row["label"]) if is_ontarget else None,
         predicted_efficacy=None if pd.isna(predicted) else float(predicted),
         locus=row["locus"],
@@ -450,8 +507,10 @@ def resolve_seed_guide(config, scorer=None, target: str | None = None) -> SeedGu
         )
     elif mode == "examples":
         cfg = config.seed_guide.examples
-        guide = select_negative_from_examples(cfg.path, cfg.index, scorer=scorer,
-                                              rank_by=cfg.rank_by)
+        guide = select_negative_from_examples(
+            cfg.path, cfg.index, scorer=scorer, rank_by=cfg.rank_by,
+            target_selection=cfg.target_selection, target_id=cfg.target_id,
+        )
     elif mode == "target_scan":
         if scorer is None:
             raise ValueError("seed_guide.mode='target_scan' needs a scorer")

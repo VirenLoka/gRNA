@@ -7,6 +7,7 @@ load time instead of silently taking a default halfway through a training run.
 from __future__ import annotations
 
 import dataclasses
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, get_type_hints
@@ -18,7 +19,12 @@ import yaml
 class RunConfig:
     name: str | None = None            # auto-timestamped when null
     output_dir: str = "runs"
-    seed: int = 42
+    # null -> a fresh seed is drawn each run (logged, and written into
+    #         config.resolved.yaml, so any specific run can be reproduced later
+    #         by pinning this to that value).  This is what makes
+    #         seed_guide.examples.target_selection: random pick a different
+    #         target every run by default -- pin an int here to hold it fixed.
+    seed: int | None = None
     device: str = "auto"               # auto | cpu | cuda | mps
     log_level: str = "INFO"
 
@@ -50,11 +56,25 @@ class DatasetSeedConfig:
 @dataclass
 class ExamplesSeedConfig:
     path: str = "DeepCRISPR/examples/eg_reg_off_target.repiotrt"
-    index: int = 0                     # 0 = weakest candidate
+    index: int = 0                     # 0 = weakest candidate within the chosen group
     # predicted -> rank by the frozen on-target model (required for off-target
     #              files, whose labels are all 0.0 and mean something else)
     # label     -> rank by the file's own label
     rank_by: str = "predicted"
+
+    # random -> pick a different target site each run, uniform over the file's
+    #           *unique* target sites (drawn from the already-seeded `random`
+    #           module, so it follows run.seed).  Sampling rows directly instead
+    #           of unique targets would be skewed: in the shipped
+    #           eg_reg_off_target.repiotrt, 1 of 13 unique targets alone
+    #           accounts for 67 of the 100 rows.
+    # fixed   -> rank every row in the file together and take `index` globally,
+    #           ignoring which target it belongs to (the original behaviour).
+    # Applies only to the paired off-target formats (.epiotrt/.repiotrt); the
+    # on-target formats have no target column distinct from the guide, so this
+    # is ignored for them.
+    target_selection: str = "random"
+    target_id: str | None = None       # e.g. "sg14" -- pins one target, overriding target_selection
 
 
 @dataclass
@@ -90,9 +110,31 @@ class GumbelConfig:
 
 
 @dataclass
+class ValidityConfig:
+    """Hard gates: violating sequences are unreachable, never merely penalised.
+
+    Enforced by masking logits during left-to-right sampling, so nothing invalid
+    can be generated and nothing invalid ever reaches DeepCRISPR.
+    """
+
+    enabled: bool = True
+    # Ban runs of length >= this value. null disables the rule.
+    max_homopolymer_run: int | None = 5
+    max_t_run: int | None = 4            # Pol III (U6/H1) terminator
+    # Off by default; flip on without touching anything else.
+    forbid_g_quadruplex: bool = False
+    gc_min: float | None = None          # viability floor, e.g. 0.20
+    gc_max: float | None = None          # viability ceiling, e.g. 0.85
+    forbidden_kmers: list[str] = field(default_factory=list)
+    # Tripwire immediately before the scorer call. Should never fire.
+    assert_before_scoring: bool = True
+
+
+@dataclass
 class ConstraintConfig:
     lock_pam: bool = True
     pam_lock_positions: list[int] = field(default_factory=lambda: [21, 22])
+    validity: ValidityConfig = field(default_factory=ValidityConfig)
     # Guards left off by default per the Stage-0 decision (PAM lock only).
     # Raise any weight above 0 to switch that penalty on.
     edit_distance_weight: float = 0.0
@@ -171,6 +213,20 @@ def load_config(path: str | Path) -> Config:
     with path.open() as handle:
         raw = yaml.safe_load(handle) or {}
     return _build(Config, raw, "")
+
+
+def resolve_seed(seed: int | None) -> int:
+    """Resolve ``run.seed``, drawing fresh high-entropy randomness when null.
+
+    A null seed is the default.  It is what makes target selection (and
+    everything else seeded from it -- weight init, dropout, Gumbel noise) vary
+    from run to run.  The caller is expected to log and persist the returned
+    value, so any specific run can be reproduced later by pinning ``run.seed``
+    to that number.
+    """
+    if seed is not None:
+        return seed
+    return random.SystemRandom().randrange(2**31 - 1)
 
 
 def resolve_device(name: str = "auto"):

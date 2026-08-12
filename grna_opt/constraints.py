@@ -1,23 +1,34 @@
 """Biological constraints on generated guides.
 
-Per the Stage-0 decision the only constraint active by default is the **PAM
-lock**.  It is enforced structurally rather than as a penalty: the logits at the
-locked positions are masked to -inf everywhere except the required base, so
-every sample is a valid SpCas9 site by construction and no reward is ever spent
-learning to keep the PAM.
+Two mechanisms, doing different jobs:
 
-The remaining functions are soft penalties, all weighted 0.0 in the shipped
-config.  They exist because optimising directly against a frozen CNN reliably
-finds adversarial sequences — 23-mers that score near 1.0 and mean nothing
-biologically.  Raise the corresponding weight in ``config.yaml`` to switch one
-on; nothing else needs to change.
+**Hard gates** make a sequence unreachable.  Two kinds are active:
+
+* the **PAM lock** below, a static position-wise logit mask -- valid because
+  "position 21 must be G" is context-free;
+* the **validity automaton** in :mod:`grna_opt.validity`, for context-dependent
+  RNA chemistry (Pol III terminators, homopolymer runs, and optionally
+  G-quadruplexes, GC viability bounds and forbidden k-mers).
+
+Neither spends any reward: violations simply cannot be sampled, so nothing
+invalid ever reaches DeepCRISPR.
+
+**Soft penalties** (the functions below) are gradient nudges applied after the
+scorer has already seen the sequence.  They express *preferences* -- stay near
+the seed, keep GC in the comfortable 40-70% band -- rather than viability.  All
+are weighted 0.0 in the shipped config; raise a weight to switch one on.
+
+The split matters: a penalty cannot guarantee anything, because the violating
+sample is still generated and still scored.  Anything that must never happen
+belongs in :mod:`grna_opt.validity`, not here.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .encoding import NT_TO_IDX, VOCAB_SIZE
+from .encoding import NT_TO_IDX, SPACER_LENGTH, VOCAB_SIZE
+from .validity import ValidityAutomaton, build_rules
 
 _NEG_INF = -1e9
 
@@ -124,6 +135,10 @@ class ConstraintSet:
             seed_region_weights(guide_length, config.seed_region_start, device=device)
             if config.seed_region_weight > 0 else None
         )
+
+        # Hard validity gates, enforced during sampling rather than scored.
+        self.validity_rules = build_rules(config.validity, spacer_length=SPACER_LENGTH)
+        self.automaton = ValidityAutomaton(self.validity_rules)
 
     def apply_logit_mask(self, logits: torch.Tensor) -> torch.Tensor:
         """Structurally enforce the PAM before sampling."""

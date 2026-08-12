@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 
 _EPS = 1e-10
+# Finite rather than -inf: an all-masked row would otherwise softmax to NaN.
+_NEG_INF = -1e9
 
 
 def sample_gumbel(shape, device, dtype=torch.float32) -> torch.Tensor:
@@ -69,6 +71,52 @@ def gumbel_softmax(logits: torch.Tensor, tau: float = 1.0, hard: bool = True,
     y_hard = torch.zeros_like(y_soft).scatter_(-1, index, 1.0)
     y = (y_hard - y_soft).detach() + y_soft
     return y, y_soft
+
+
+def constrained_gumbel_softmax(logits: torch.Tensor, automaton, tau: float = 1.0,
+                               hard: bool = True, noise_scale: float = 1.0,
+                               static_mask: torch.Tensor | None = None,
+                               ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a sequence left to right, masking illegal bases at every position.
+
+    Context-dependent rules ("T is banned here *if* the previous three were TTT")
+    cannot be written as a precomputed ``[length, vocab]`` mask, so sampling walks
+    the sequence and asks the automaton which bases remain legal given the prefix
+    already committed.  The result is valid by construction.
+
+    The generator is untouched by this: it still emits all positions in a single
+    parallel forward pass.  Only sampling is sequential, and it costs one small
+    masking op per position with no extra model evaluations.
+
+    Args:
+        logits: ``[batch, length, vocab]`` from the generator.
+        automaton: a :class:`~grna_opt.validity.ValidityAutomaton`.
+        static_mask: optional ``[length, vocab]`` additive mask applied on top
+            (this is where the position-wise PAM lock enters).
+        noise_scale: 0.0 makes this a deterministic constrained greedy decode.
+
+    Returns:
+        ``(y, y_soft)`` stacked to ``[batch, length, vocab]``, with the same
+        straight-through gradient semantics as :func:`gumbel_softmax`.
+    """
+    batch, length, _ = logits.shape
+    automaton.reset(batch, logits.device)
+
+    samples, softs = [], []
+    for position in range(length):
+        step_logits = logits[:, position, :]
+        if static_mask is not None:
+            step_logits = step_logits + static_mask[position].unsqueeze(0)
+
+        legal = automaton.allowed(position)
+        step_logits = step_logits.masked_fill(~legal, _NEG_INF)
+
+        y, y_soft = gumbel_softmax(step_logits, tau=tau, hard=hard, noise_scale=noise_scale)
+        automaton.advance(position, y.argmax(dim=-1))
+        samples.append(y)
+        softs.append(y_soft)
+
+    return torch.stack(samples, dim=1), torch.stack(softs, dim=1)
 
 
 def anneal_temperature(step: int, total_steps: int, tau_start: float, tau_end: float,

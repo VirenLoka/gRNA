@@ -13,7 +13,13 @@
 run:
   name: null              # null -> runs/run_<timestamp>
   output_dir: runs
-  seed: 42
+  # null -> a fresh seed is drawn each run (logged, and written into
+  #         config.resolved.yaml so that specific run can be reproduced later
+  #         by pinning this value, or via `python run.py --seed <value>`).
+  #         This is what makes seed_guide.examples.target_selection: random
+  #         pick a different target every run. Pin an int for fully
+  #         reproducible runs (same target, same weight init, same everything).
+  seed: null
   device: auto            # auto | cpu | cuda | mps
   log_level: INFO
 
@@ -61,14 +67,22 @@ seed_guide:
     # Off-target file: each row pairs an off-target site (the negative — it does
     # not cut) with the sgRNA's intended target site, ~5-6 mismatches away.
     path: DeepCRISPR/examples/eg_reg_off_target.repiotrt
-    index: 0              # 0 = weakest candidate under the chosen ranking
+    index: 0              # 0 = weakest candidate within the chosen target's group
 
-    # predicted -> rank all rows by the frozen on-target model, ascending.
+    # predicted -> rank candidates by the frozen on-target model, ascending.
     #              Required for off-target files: every label in them is 0.0 and
     #              scores cleavage at the off-target locus, not on-target
     #              efficacy, so labels cannot order candidates for this task.
     # label     -> rank by the file's own label (on-target files only)
     rank_by: predicted
+
+    # random -> pick a different target site each run, uniform over the file's
+    #           13 *unique* target sites (not the 100 rows — those are skewed:
+    #           1 target alone accounts for 67 of them).  Follows run.seed.
+    # fixed   -> rank every row in the file together, ignoring which target it
+    #           belongs to (this was the only behaviour before).
+    target_selection: random
+    target_id: null       # e.g. "sg14" -- pin one target, overriding target_selection
 
   dataset:
     # Auto-extracted from DeepCRISPR/paper_data-regression.tar.gz on first use.
@@ -104,6 +118,46 @@ constraints:
   # so every sample is a valid SpCas9 site and no reward is spent on it.
   lock_pam: true
   pam_lock_positions: [21, 22]   # 0-indexed: the GG of NGG. Position 20 (N) stays free.
+
+  # --- HARD GATES: violating spacers are unreachable, never merely penalised ---
+  # Enforced by masking logits during left-to-right sampling, so nothing invalid
+  # is ever generated and nothing invalid ever reaches DeepCRISPR.
+  #
+  # Scope is the spacer (positions 0-19) only. The PAM at 20-22 is target DNA,
+  # not part of the sgRNA molecule, so RNA chemistry does not apply to it.
+  validity:
+    enabled: true
+
+    # Pol III (U6/H1) terminates transcription at a run of 4+ T's, truncating
+    # the sgRNA — the one true "molecule never gets made" failure. Set to null
+    # if you switch to synthetic/IVT guides, where it does not apply.
+    max_t_run: 4
+
+    # Long single-base runs cause synthesis errors and slippage; poly-G also
+    # aggregates. This is what would have stopped the earlier poly-G collapse.
+    max_homopolymer_run: 5
+
+    # --- available, off by default: flip on, nothing else needs changing ---
+
+    # Canonical G3N(1-7)G3N(1-7)G3N(1-7)G3. A genuinely different failure from a
+    # long G run: continuous GGGGGGGGGG is one tract and does NOT match this,
+    # while GGGAGGGAGGGAGGGA matches with no run longer than 3.
+    forbid_g_quadruplex: false
+
+    # VIABILITY band, not the 40-70% comfort band (that is gc_weight below).
+    # Below ~20% the R-loop will not hold; above ~85% it will not unwind.
+    # Enforced exactly by feasibility counting, so it never dead-ends.
+    gc_min: null                 # try 0.20
+    gc_max: null                 # try 0.85
+
+    # Spacer-scaffold complementarity: seed this with every k-mer whose reverse
+    # complement occurs in the sgRNA scaffold, via
+    # grna_opt.validity.scaffold_forbidden_kmers(scaffold, k=7)
+    forbidden_kmers: []
+
+    # Tripwire immediately before the scorer call. Should never fire; if it
+    # does, the automaton and the string checker have diverged.
+    assert_before_scoring: true
 
   # Soft guards, all off per the chosen setup. Optimising against a frozen CNN
   # with no restraint will find adversarial sequences that score high and mean

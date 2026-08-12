@@ -143,6 +143,81 @@ shift the feature map.
 Each run writes `runs/<name>/` containing `config.resolved.yaml`, `run.log`,
 `metrics.csv` (per-step), `summary.json`, and generator checkpoints.
 
+## Hard validity gates
+
+Chemically implausible spacers are made **unreachable**, not penalised. A
+penalty is a gradient nudge applied *after* the scorer already saw the sequence;
+a gate means the sequence can never be sampled, so nothing invalid ever reaches
+DeepCRISPR.
+
+Active by default (spacer positions 0–19 only — the PAM at 20–22 is target DNA,
+not part of the sgRNA molecule, so RNA chemistry does not apply to it):
+
+| Gate | Why it's a true failure |
+|---|---|
+| **`max_t_run: 4`** | 4+ T's → 4+ U's terminates Pol III (U6/H1) transcription. The guide is truncated and never exists as designed. Set to `null` for synthetic/IVT guides, where it does not apply. |
+| **`max_homopolymer_run: 5`** | Synthesis errors, polymerase slippage; poly-G aggregates. This is what stops the poly-G collapse. |
+
+Available, off by default — flip on, nothing else changes:
+`forbid_g_quadruplex`, `gc_min`/`gc_max` (the ~0.20/0.85 *viability* band, not
+the 0.40–0.70 comfort band), and `forbidden_kmers` (seed it via
+`validity.scaffold_forbidden_kmers(scaffold, k=7)` to stop the spacer
+base-pairing with its own sgRNA scaffold).
+
+**G4 and homopolymer catch different things.** A continuous `GGGGGGGGGG` is a
+single tract and does *not* match the canonical `G₃N₁₋₇G₃N₁₋₇G₃N₁₋₇G₃` motif;
+`GGGAGGGAGGGAGGGA` matches it with no run longer than 3. Catching both needs
+both rules.
+
+### How the gate works
+
+The PAM lock is a static `[23, 4]` additive mask, which works because "position
+21 must be G" is context-free. Chemistry is not: whether `T` is legal at
+position *i* depends on positions *i-3..i-1*, which no precomputed mask can
+express.
+
+So sampling runs **left to right**, and a prefix automaton
+([validity.py](grna_opt/validity.py)) reports which bases remain legal given
+what's already committed:
+
+```
+for i in 0..22:
+    allowed = automaton.step(prefix)      # [B, 4] bool
+    y_i     = gumbel_softmax(logits[:,i,:] + log(allowed), tau, hard=True)
+    automaton.advance(y_i)
+```
+
+The generator is untouched — it still emits all 23 positions in one parallel
+forward pass. Only *sampling* is sequential, costing one small masking op per
+position with **no extra model evaluations**. Straight-through gradients are
+unchanged, since the mask is a detached constant. Greedy decoding runs through
+the same path with noise off, so the reported answer obeys the gates too.
+
+GC bounds look global but are enforced *exactly* by feasibility counting (ban a
+base only if it makes the band unreachable in the remaining positions) — verified
+to drive samples to precisely the 20%/85% boundary under extreme bias rather
+than dead-ending. What genuinely cannot be gated this way is full thermodynamic
+self-folding (hairpin MFE); that is global and non-differentiable, would need
+ViennaRNA, and could only work as post-hoc rejection.
+
+### The seed may itself be invalid
+
+**50 of 610 real sequences in `DeepCRISPR/examples/` violate these gates**,
+including the shipped default seed `GAATTGTCTGGATTGTTTTC` (poly-T) and its
+paired target `GACTTGTTTTCATTGTTCTC`. This is expected — it's real biology, not
+bad data — and has three consequences:
+
+1. The pre-scorer assert applies **only to generated candidates**, never to
+   reference data. Ranking real sequences must not crash.
+2. `identity_bias` points at a sequence the sampler cannot reproduce, so step 0
+   will not equal the seed. Observed: step 0 emits
+   `GAATTGTCTGGATTGTTT`**`C`**`CAGG` — the minimal 1nt fix to the `TTTT`.
+3. The optimiser is now *required* to fix a genuine transcription defect.
+
+`assert_before_scoring: true` is a tripwire immediately before the scorer call.
+It should never fire; if it does, the automaton and the string checker have
+diverged.
+
 ## Design notes
 
 **PAM lock is structural, not a penalty.** Logits at positions 21–22 are masked

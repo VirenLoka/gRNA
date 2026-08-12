@@ -35,8 +35,10 @@ from .constraints import ConstraintSet
 from .encoding import (GUIDE_LENGTH, hamming_distance, one_hot_to_sequence,
                        sequence_to_indices)
 from .generator import GuideOptimizer
-from .gumbel import anneal_temperature, distribution_entropy, gumbel_softmax
+from .gumbel import (anneal_temperature, constrained_gumbel_softmax,
+                     distribution_entropy)
 from .logging_utils import MetricHistory, get_logger
+from .validity import assert_batch_valid, check_sequence
 
 
 @dataclass
@@ -53,6 +55,9 @@ class OptimizationResult:
     hamming_distance: int = 0
     steps_run: int = 0
     wall_seconds: float = 0.0
+    seed_violations: list[str] = field(default_factory=list)
+    best_violations: list[str] = field(default_factory=list)
+    validity_gates_active: bool = False
 
     @property
     def improvement(self) -> float:
@@ -70,6 +75,14 @@ class OptimizationResult:
                 f"{m['from']}{m['position'] + 1}{m['to']}" for m in self.mutations
             )
             lines.append(f"mutations {changes}")
+        if self.seed_violations:
+            lines.append(f"seed was invalid: {'; '.join(self.seed_violations)}")
+        if not self.validity_gates_active:
+            lines.append("validity   no gates active — chemistry was not checked")
+        elif self.best_violations:
+            lines.append(f"validity   FAILED: {'; '.join(self.best_violations)}")
+        else:
+            lines.append("validity   optimised guide passes all active gates")
         return lines
 
 
@@ -114,9 +127,17 @@ class GuideTrainer:
             weight_decay=config.training.weight_decay,
         )
         self.history = MetricHistory(self.run_dir)
+        self.assert_validity = config.constraints.validity.assert_before_scoring
 
         with torch.no_grad():
             self.seed_score = float(self.scorer(self.seed_one_hot)[0])
+
+        # The seed comes from real data and may itself violate the gates -- the
+        # shipped default does (poly-T). That is not an error: it means the
+        # generator is now *required* to fix a genuine defect, and it also means
+        # identity_bias points at a sequence the sampler can never reproduce, so
+        # step 0 will not equal the seed.
+        self.seed_violations = check_sequence(seed_sequence, self.constraints.validity_rules)
 
         self.best_sequence = seed_sequence
         self.best_score = self.seed_score
@@ -127,12 +148,31 @@ class GuideTrainer:
         logits = self.generator(self.seed_idx, self.target_idx)
         return self.constraints.apply_logit_mask(logits)
 
+    def _sample(self, logits: torch.Tensor, tau: float, n_samples: int,
+                noise_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draw constrained straight-through samples from per-position logits.
+
+        The PAM mask is already folded into ``logits``; the automaton adds the
+        context-dependent chemistry gates as sampling walks left to right.
+        """
+        batched = logits.expand(n_samples, -1, -1)
+        return constrained_gumbel_softmax(
+            batched, self.constraints.automaton, tau=tau,
+            hard=self.config.gumbel.hard, noise_scale=noise_scale,
+        )
+
     @torch.no_grad()
     def greedy_decode(self) -> tuple[str, float]:
-        """Deterministic argmax decode and its predicted efficacy."""
+        """Deterministic decode and its predicted efficacy.
+
+        Runs through the same constrained sampler with the noise switched off,
+        so the reported answer obeys the validity gates too.  A plain
+        ``logits.argmax`` would ignore them and could surface an invalid guide
+        as the final result.
+        """
         self.generator.eval()
         logits = self._masked_logits()
-        one_hot = F.one_hot(logits.argmax(dim=-1), num_classes=4).float()
+        one_hot, _ = self._sample(logits, tau=1.0, n_samples=1, noise_scale=0.0)
         score = float(self.scorer(one_hot)[0])
         self.generator.train()
         return one_hot_to_sequence(one_hot[0]), score
@@ -153,11 +193,32 @@ class GuideTrainer:
                          f"{self.generator.num_parameters():,}")
         self.logger.info("seed guide %s scores %.4f under %s",
                          self.seed_sequence, self.seed_score, self.scorer.source_model)
+
+        rules = self.constraints.validity_rules
+        if rules.active:
+            self.logger.info("hard validity gates active — violations are unreachable, "
+                             "not penalised:")
+            for line in rules.describe():
+                self.logger.info("  · %s", line)
+            if self.seed_violations:
+                self.logger.warning(
+                    "the seed guide itself violates the gates (%s) — it comes from real "
+                    "data, so this is expected; the optimiser is now required to fix it, "
+                    "and step 0 will not reproduce the seed",
+                    "; ".join(self.seed_violations),
+                )
+        else:
+            self.logger.warning("no validity gates active — nothing prevents the optimiser "
+                                "from emitting biologically impossible spacers")
         if not self.constraints.any_penalty_active:
+            preamble = ("the hard gates guarantee chemical validity but place no limit"
+                        if rules.active else
+                        "nothing constrains chemistry, and nothing places a limit")
             self.logger.info(
-                "PAM lock is the only active constraint — the optimiser is free to "
-                "drift arbitrarily far from the seed, and adversarial high-scoring "
-                "sequences are expected (raise constraints.*_weight to restrain it)"
+                "no soft penalties active — %s on how far the guide drifts from the "
+                "seed, so target-mismatched high scorers are still expected (raise "
+                "constraints.edit_distance_weight / seed_region_weight to restrain it)",
+                preamble,
             )
 
         self.generator.train()
@@ -168,8 +229,10 @@ class GuideTrainer:
                                      gumbel_cfg.tau_end, gumbel_cfg.anneal)
 
             logits = self._masked_logits()                       # [1, 23, 4]
-            batched = logits.expand(gumbel_cfg.n_samples, -1, -1)  # [S, 23, 4]
-            one_hot, soft = gumbel_softmax(batched, tau=tau, hard=gumbel_cfg.hard)
+            one_hot, soft = self._sample(logits, tau, gumbel_cfg.n_samples)
+
+            if self.assert_validity:
+                assert_batch_valid(one_hot, self.constraints.validity_rules)
 
             scores = self.scorer(one_hot)                        # [S]
             reward = scores.mean()
@@ -234,6 +297,13 @@ class GuideTrainer:
         self._register(final_sequence, final_score)
         self.save_checkpoint(cfg.steps, name="generator_final.pt")
 
+        if self.constraints.automaton.relaxation_events:
+            self.logger.warning(
+                "validity gates were relaxed %d time(s) because the active rules left no "
+                "legal base at some position — review constraints.validity for conflicts",
+                self.constraints.automaton.relaxation_events,
+            )
+
         return OptimizationResult(
             seed_sequence=self.seed_sequence,
             seed_score=self.seed_score,
@@ -245,6 +315,10 @@ class GuideTrainer:
             hamming_distance=hamming_distance(self.seed_sequence, self.best_sequence),
             steps_run=cfg.steps,
             wall_seconds=time.time() - started,
+            seed_violations=self.seed_violations,
+            best_violations=check_sequence(self.best_sequence,
+                                           self.constraints.validity_rules),
+            validity_gates_active=self.constraints.validity_rules.active,
         )
 
     def save_checkpoint(self, step: int, name: str | None = None) -> Path:

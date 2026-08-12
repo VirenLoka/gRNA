@@ -5,8 +5,14 @@ Trains a randomly-initialised cross-attention transformer to mutate one
 low-efficacy guide into a high-efficacy one, using a frozen DeepCRISPR on-target
 CNN as the reward model.
 
+With the shipped config, each run draws a fresh seed and a different target
+site from DeepCRISPR/examples/eg_reg_off_target.repiotrt (13 unique targets) —
+pass --seed to reproduce a specific run, or --seed-guide/--target for a fixed
+pair.
+
     python run.py                                  # defaults from config.yaml
     python run.py --config config.yaml
+    python run.py --seed 12345                     # reproduce a prior run
     python run.py --target-file my_region.fa       # override the target DNA
     python run.py --seed-guide TGGTTCTATACTCAGGAGCCAGG
     python run.py --steps 500 --device cpu
@@ -22,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from grna_opt.config import load_config, resolve_device
+from grna_opt.config import load_config, resolve_device, resolve_seed
 from grna_opt.data import clean_dna, resolve_seed_guide
 from grna_opt.encoding import GUIDE_LENGTH, hamming_distance
 from grna_opt.logging_utils import (create_run_dir, save_config_snapshot,
@@ -46,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, help="override training.steps")
     parser.add_argument("--device", type=str, help="override run.device")
     parser.add_argument("--run-name", type=str, help="override run.name")
+    parser.add_argument("--seed", type=int,
+                        help="pin run.seed (default: null, a fresh seed drawn each run)")
     return parser.parse_args()
 
 
@@ -65,6 +73,8 @@ def apply_overrides(config, args: argparse.Namespace) -> None:
         config.run.device = args.device
     if args.run_name:
         config.run.name = args.run_name
+    if args.seed is not None:
+        config.run.seed = args.seed
 
 
 def set_seed(seed: int) -> None:
@@ -81,15 +91,22 @@ def main() -> int:
 
     run_dir = create_run_dir(config.run.output_dir, config.run.name)
     logger = setup_logging(run_dir, config.run.log_level)
-    save_config_snapshot(run_dir, config.to_dict())
 
+    # Resolved (not just applied) before the config snapshot is written, so a
+    # null seed's *actual* drawn value ends up in config.resolved.yaml and this
+    # run stays reproducible even though the default varies run to run.
+    seed_was_null = config.run.seed is None
+    config.run.seed = resolve_seed(config.run.seed)
     set_seed(config.run.seed)
+    save_config_snapshot(run_dir, config.to_dict())
     device = resolve_device(config.run.device)
 
     logger.info("=" * 78)
     logger.info("guide RNA optimisation engine")
     logger.info("run directory: %s", run_dir)
-    logger.info("device: %s | seed: %d", device, config.run.seed)
+    logger.info("device: %s | seed: %d%s", device, config.run.seed,
+                " (auto-drawn — pass --seed or set run.seed to reproduce this run)"
+                if seed_was_null else "")
     logger.info("=" * 78)
 
     # --- frozen reward model ------------------------------------------------
@@ -161,6 +178,7 @@ def main() -> int:
     summary = {
         "run_dir": str(run_dir),
         "device": str(device),
+        "seed": config.run.seed,
         "scorer": scorer.source_model,
         "target_source": config.target.source,
         "target_name": config.target.name,
@@ -184,6 +202,9 @@ def main() -> int:
         "improvement": result.improvement,
         "hamming_distance": result.hamming_distance,
         "mutations": result.mutations,
+        "seed_validity_violations": result.seed_violations,
+        "best_validity_violations": result.best_violations,
+        "validity_gates": config.constraints.validity.__dict__,
         "steps": result.steps_run,
         "wall_seconds": result.wall_seconds,
     }
